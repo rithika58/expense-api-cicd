@@ -1,0 +1,170 @@
+# ---------------------------------------------------------------------------
+# CI/CD pipeline: pull request -> lint + test, merge to main -> build, push
+# to Amazon ECR, deploy to EC2 with a health-checked zero-downtime swap.
+#
+# Required repository secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  (deploy user, scoped to ECR + EC2)
+#   EC2_HOST, EC2_USER, EC2_SSH_KEY           (private key for the server)
+#   APP_URL                                  (optional, e.g. http://1.2.3.4)
+# ---------------------------------------------------------------------------
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:        # lets you re-run a deploy by hand
+
+# A new push to the same branch cancels the previous run.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: expense-api
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ------------------------------------------------------------- stage 1 ----
+  lint-and-test:
+    name: Lint & test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint with flake8
+        run: flake8 app tests wsgi.py
+
+      - name: Run unit tests
+        run: |
+          pytest -q \
+            --cov=app --cov-report=term-missing \
+            --cov-fail-under=85
+
+  # ------------------------------------------------------------- stage 2 ----
+  build-and-push:
+    name: Build image, smoke test & push to ECR
+    needs: lint-and-test
+    if: github.event_name != 'pull_request'      # never push from a PR
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure the ECR repository exists
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
+                 --image-scanning-configuration scanOnPush=true >/dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally for the smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image before publishing it
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker run -d --name smoke -p 8000:8000 "$IMAGE"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              echo "health endpoint is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "container never became healthy - dumping logs"
+          docker logs smoke
+          exit 1
+
+      - name: Push SHA-tagged image to ECR
+        run: docker push "${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+  # ------------------------------------------------------------- stage 3 ----
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ secrets.APP_URL }}
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          SHA: ${{ github.sha }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE,SHA,AWS_REGION
+          script_stop: true
+          command_timeout: 10m
+          script: |
+            sudo AWS_REGION="$AWS_REGION" /opt/expense-api/bin/remote-deploy.sh "$IMAGE" "$SHA"
+
+      - name: Verify the new version is live
+        if: env.APP_URL != ''
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          for i in $(seq 1 10); do
+            live=$(curl -fsS "${APP_URL}/version" | python -c "import json,sys;print(json.load(sys.stdin)['git_sha'])" || true)
+            if [ "$live" = "${GITHUB_SHA}" ]; then
+              echo "production is serving commit ${GITHUB_SHA}"
+              exit 0
+            fi
+            echo "attempt ${i}: live=${live:-unreachable} expected=${GITHUB_SHA}"
+            sleep 5
+          done
+          echo "deployed SHA does not match the merged commit"
+          exit 1
